@@ -1,11 +1,11 @@
 package GeTuiGo
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
@@ -234,8 +234,36 @@ func NewClient(appId, appKey, masterSecret string) (*Client, error) {
 	return client, nil
 }
 
-func authRequest(method, url, data string) (*http.Request, error) {
+func (c *Client) requestWithAuth(method, url, data string, respData interface{}) error {
+	var reader io.Reader
+	if data != "" {
+		reader = strings.NewReader(data)
+	}
 
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("authtoken", c.authToken)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	respBody, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(respBody, &respData)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // 对使用App的某个用户，单独推送消息
@@ -251,71 +279,37 @@ func authRequest(method, url, data string) (*http.Request, error) {
 //  - successed_ignore  非活跃用户不下发
 func (c *Client) SinglePush(push *Push) (result PushResult, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/push_single", c.appId)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(push.ToJsonString(c.appKey)))
-	if err != nil {
-		return
-	}
-
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var respData PushResult
-	err = json.Unmarshal(respBody, &respData)
-	if err != nil {
-		return
-	}
+	err = c.requestWithAuth("POST", url, push.ToJsonString(c.appKey), &respData)
+	return respData, err
+}
 
-	return respData, nil
+type SinglePushBatchResult struct {
+	Result  string `json:"result"`
+	Details []struct {
+		TaskId string `json:"taskid"`
+		Cid    string `json:"cid"`
+		Status string `json:"status"`
+	} `json:"details"`
 }
 
 // 批量单推接口
 //  在给每个用户的推送内容都不同的情况下，又因为单推消息发送较慢，可以使用此接口。
-func (c *Client) SinglePushBatch(pushList []*Push, needDetail bool) (result, taskId, desc string, err error) {
+func (c *Client) SinglePushBatch(pushList []*Push, needDetail bool) (result SinglePushBatchResult, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/push_single_batch", c.appId)
 
 	list := make([]string, len(pushList))
-	for _, push := range pushList {
+	for i, push := range pushList {
 		str := push.ToJsonString(c.appKey)
-		list = append(list, str)
+		list[i] = str
 	}
 	body := fmt.Sprintf(`{"msg_list":[%s],"need_detail":%s}`, strings.Join(list, ","), strconv.FormatBool(needDetail))
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
+	err = c.requestWithAuth("POST", url, body, &result)
+
 	if err != nil {
 		return
 	}
 
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
-	var resultData map[string]string
-
-	err = json.Unmarshal(respBody, &resultData)
-	if err != nil {
-		return
-	}
-
-	result = resultData["result"]
-	taskId = resultData["taskid"]
-	desc = resultData["desc"]
 	return
 }
 
@@ -328,30 +322,13 @@ func (c *Client) SinglePushBatch(pushList []*Push, needDetail bool) (result, tas
 //  desc    错误信息描述
 func (c *Client) SaveListBody(push *Push) (result, taskId, desc string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/save_list_body", c.appId)
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(push.ToJsonString(c.appKey)))
-	if err != nil {
-		return
-	}
-
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var respData struct {
 		Result string `json:"result"` // 响应结果，见详情
 		TaskId string `json:"taskid"` // 任务标识号，用于tolist接口的taskid
 		Desc   string `json:"desc"`   // 错误信息描述
 	}
-	err = json.Unmarshal(respBody, &respData)
+
+	err = c.requestWithAuth("POST", url, push.ToJsonString(c.appKey), &respData)
 	if err != nil {
 		return
 	}
@@ -365,61 +342,20 @@ func (c *Client) SaveListBody(push *Push) (result, taskId, desc string, err erro
 //  result		推送结果
 func (c *Client) PushList(pushList *PushList) (result PushListResult, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/push_list", c.appId)
-
 	body, _ := json.Marshal(pushList)
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
-	err = json.Unmarshal(respBody, &result)
-	if err != nil {
-		return
-	}
-
+	err = c.requestWithAuth("POST", url, string(body), &result)
 	return
 }
 
 // 群推
 //  针对某个，根据筛选条件，将消息群发给符合条件客户群
-func (c *Client) PushToApp(push *Push) (result, taskId, desc string) {
+func (c *Client) PushToApp(push *Push) (result, taskId, desc string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/push_app", c.appId)
-	req, err := http.NewRequest("POST", url, strings.NewReader(push.ToJsonString(c.appKey)))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, push.ToJsonString(c.appKey), &resultData)
 	if err != nil {
 		return
 	}
-
 	result = resultData["result"]
 	taskId = resultData["taskid"]
 	desc = resultData["desc"]
@@ -428,27 +364,13 @@ func (c *Client) PushToApp(push *Push) (result, taskId, desc string) {
 
 // stop群推任务
 //  在有效期内的消息进行停止
-func (c *Client) StopTask(taskId string) (result, respTaskId string) {
+func (c *Client) StopTask(taskId string) (result, respTaskId string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/stop_task/%s", c.appId, taskId)
-	req, err := http.NewRequest("DELETE", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("DELETE", url, "", &resultData)
+	if err != nil {
+		return
+	}
 
 	result = resultData["result"]
 	taskId = resultData["taskid"]
@@ -470,24 +392,12 @@ type ScheduleTaskResult struct {
 //  应用场景: 该接口主要用来在需要查看返回已提交的定时任务的相关信息。
 func (c *Client) GetScheduleTask(taskId string) (*ScheduleTaskResult, error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/get_schedule_task", c.appId)
-	req, err := http.NewRequest("POST", url, strings.NewReader(fmt.Sprintf(`{"taskid":"%s"}`, taskId)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	var resultData = &ScheduleTaskResult{}
-	err = json.Unmarshal(respBody, &resultData)
+
+	err := c.requestWithAuth("POST", url, fmt.Sprintf(`{"taskid":"%s"}`, taskId), &resultData)
+	if err != nil {
+		return nil, err
+	}
 	return resultData, nil
 }
 
@@ -495,24 +405,8 @@ func (c *Client) GetScheduleTask(taskId string) (*ScheduleTaskResult, error) {
 //  应用场景: 用来删除还未下发的任务
 func (c *Client) DelScheduleTask(taskId string) (result string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/del_schedule_task", c.appId)
-	req, err := http.NewRequest("POST", url, strings.NewReader(fmt.Sprintf(`{"taskid":"%s"}`, taskId)))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return "", err
-	}
-
 	var resultData = map[string]string{}
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, fmt.Sprintf(`{"taskid":"%s"}`, taskId), &resultData)
 	return resultData["result"], nil
 }
 
@@ -528,27 +422,11 @@ type Alias struct {
 //  目前一个别名最多支持绑定10个ClientID
 func (c *Client) BindAlias(aliasList []Alias) (result, desc string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/bind_alias", c.appId)
+	var resultData = map[string]string{}
 
 	data, _ := json.Marshal(aliasList)
 	body := fmt.Sprintf(`{"alias_list":%s}`, data)
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return "", "", err
-	}
-
-	var resultData = map[string]string{}
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, body, &resultData)
 	return resultData["result"], resultData["desc"], nil
 }
 
@@ -575,57 +453,23 @@ func (c *Client) UnBindAlias(cid, alias string) (result string, err error) {
 	if err != nil {
 		return
 	}
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(data)))
-	if err != nil {
-		return
-	}
-
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData = map[string]string{}
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, string(data), &resultData)
 	return resultData["result"], nil
 }
 
 // 解绑别名所有cid
 func (c *Client) UnBindAliasAll(alias string) (result, desc string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/unbind_alias_all", c.appId)
+	var resultData = map[string]string{}
 
 	data, err := json.Marshal(fmt.Sprintf(`{"alias":"%s"}`, alias))
 	if err != nil {
 		return
 	}
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(data)))
-	if err != nil {
-		return
-	}
-
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
-	var resultData = map[string]string{}
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, string(data), &resultData)
 	return resultData["result"], resultData["desc"], nil
 }
 
@@ -633,28 +477,11 @@ func (c *Client) UnBindAliasAll(alias string) (result, desc string, err error) {
 //  通过传入的别名查询对应的cid信息
 func (c *Client) QueryCid(alias string) (result string, cidList []string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/query_cid/%s", c.appId, alias)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", nil, err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", nil, err
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return "", nil, err
-	}
-
 	var resultData struct {
 		Result string   `json:"result"`
 		Cid    []string `json:"cid"`
 	}
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("GET", url, "", &resultData)
 	return resultData.Result, resultData.Cid, nil
 }
 
@@ -662,25 +489,9 @@ func (c *Client) QueryCid(alias string) (result string, cidList []string, err er
 //  通过传入的cid查询对应的别名
 func (c *Client) QueryAlias(cid string) (result string, alias string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/query_alias/%s", c.appId, cid)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return "", "", err
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("GET", url, "", &resultData)
 	return resultData["result"], resultData["alias"], nil
 }
 
@@ -693,51 +504,21 @@ func (c *Client) SetTags(cid string, tagList []string) (result string, err error
 		Cid:     cid,
 		TagList: tagList,
 	}
+	var resultData map[string]string
 
 	body, err := json.Marshal(data)
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/set_tags", c.appKey)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
 
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
-	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, string(body), &resultData)
 	return resultData["result"], nil
 }
 
 // 查询指定用户tag属性
 func (c *Client) GetTags(cid string) (result, tags string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/get_tags/%s", c.appKey, cid)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("GET", url, "", &resultData)
 	return resultData["result"], resultData["cid"], nil
 }
 
@@ -745,24 +526,9 @@ func (c *Client) GetTags(cid string) (result, tags string, err error) {
 func (c *Client) AddBlackList(cidList []string) (result, desc string, err error) {
 	data := fmt.Sprintf(`{"cid":["%s"]}`, strings.Join(cidList, `","`))
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/user_blk_list", c.appKey)
-	req, err := http.NewRequest("POST", url, strings.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, data, &resultData)
 	return resultData["result"], resultData["desc"], nil
 }
 
@@ -770,24 +536,9 @@ func (c *Client) AddBlackList(cidList []string) (result, desc string, err error)
 func (c *Client) RemoveBlackList(cidList []string) (result, desc string, err error) {
 	data := fmt.Sprintf(`{"cid":["%s"]}`, strings.Join(cidList, `","`))
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/user_blk_list", c.appKey)
-	req, err := http.NewRequest("DELETE", url, strings.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("DELETE", url, data, &resultData)
 	return resultData["result"], resultData["desc"], nil
 }
 
@@ -795,24 +546,8 @@ func (c *Client) RemoveBlackList(cidList []string) (result, desc string, err err
 //  调用此接口可获取用户状态，如在线不在线
 func (c *Client) UserStatus(cid string) (result, lastLogin string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/user_status/%s", c.appKey, cid)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("GET", url, "", &resultData)
 	return resultData["result"], resultData["lastlogin"], nil
 }
 
@@ -848,27 +583,12 @@ func (c *Client) GetPushResult(taskIdList []string) (result string, pushResultLi
 	}
 	data := fmt.Sprintf(`{"taskIdList":["%s"]}`, strings.Join(taskIdList, `","`))
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/push_result", c.appKey)
-	req, err := http.NewRequest("POST", url, strings.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData struct {
 		Result string             `json:"result"`
 		Data   []PushResultDetail `json:"data"`
 	}
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, data, &resultData)
 	return resultData.Result, resultData.Data, nil
 }
 
@@ -886,24 +606,9 @@ type PushResultByGroup struct {
 //  根据任务组名查询推送结果，返回结果包括百日内联网用户数（活跃用户数）、实际下发数、到达数、展示数、点击数。
 func (c *Client) GetPushResultByGroup(groupName string) (result PushResultByGroup, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/get_push_result_by_group_name/%s", c.appKey, groupName)
-	req, err := http.NewRequest("POST", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData PushResultByGroup
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, "", &resultData)
 	return resultData, nil
 }
 
@@ -920,27 +625,11 @@ type AppUserStat struct {
 //  调用此接口查询推送数据，可查询消息有效可下发总数，消息回执总数和用户点击数等结果。
 func (c *Client) QueryAppUser(date time.Time) (result string, stat AppUserStat, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/query_app_push/%s", c.appKey, date.Format("20200321"))
-	req, err := http.NewRequest("POST", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData struct {
 		Result string      `json:"result"`
 		Data   AppUserStat `json:"data"`
 	}
-	err = json.Unmarshal(respBody, &resultData)
+	err = c.requestWithAuth("POST", url, "", &resultData)
 	return resultData.Result, resultData.Data, nil
 }
 
@@ -964,24 +653,9 @@ func (c *Client) IosSetBadge(badge int, msgId string, cidList, deviceTokenList [
 		return
 	}
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/set_badge", c.appKey)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]string
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, string(body), &resultData)
 	return resultData["result"], resultData["desc"], nil
 }
 
@@ -997,24 +671,9 @@ func (c *Client) QueryUserCount(condition Condition) (result string, userCount i
 		return
 	}
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/query_user_count", c.appKey)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]interface{}
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, string(body), &resultData)
 	return resultData["result"].(string), resultData["desc"].(int), nil
 }
 
@@ -1022,23 +681,8 @@ func (c *Client) QueryUserCount(condition Condition) (result string, userCount i
 //  查询应用可用的bi标签列表
 func (c *Client) QueryBiTags() (result string, tags []string, err error) {
 	url := fmt.Sprintf("https://restapi.getui.com/v1/%s/query_bi_tags", c.appKey)
-	req, err := http.NewRequest("POST", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("authtoken", c.authToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-
-	respBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return
-	}
-
 	var resultData map[string]interface{}
-	err = json.Unmarshal(respBody, &resultData)
+
+	err = c.requestWithAuth("POST", url, "", &resultData)
 	return resultData["result"].(string), resultData["tags"].([]string), nil
 }
