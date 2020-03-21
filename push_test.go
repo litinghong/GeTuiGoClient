@@ -39,3 +39,26 @@ func TestClient_SinglePush(t *testing.T) {
 
 	t.Log(result)
 }
+
+func TestClient_SaveListBody(t *testing.T) {
+	client, err := getClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	push := &Push{
+		Message: NewMessage(TypeNotification),
+		Notification: &TmplNotification{
+			TransmissionType:    false,
+			TransmissionContent: "",
+			Style:               NewStyleSystem(),
+		},
+	}
+
+	result, taskId, desc, err := client.SaveListBody(push)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log(result, taskId, desc)
+}
